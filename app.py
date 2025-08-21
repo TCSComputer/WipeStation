@@ -128,6 +128,7 @@ def device_size_bytes(devpath: str) -> int:
 def start_wipe_job(name: str, level: str):
     if name in PROTECTED_DISKS:
         raise RuntimeError("Refusing to wipe a protected disk")
+
     dev = f"/dev/{name}"
     rot = is_rotational(name)
     size = device_size_bytes(dev)
@@ -148,13 +149,15 @@ def start_wipe_job(name: str, level: str):
     }
 
     def publish():
-        events_broker.publish({"type": "job", "job": {k: (int(v) if isinstance(v, bool) else v) for k, v in job.items()}, "ts": time.time()})
+        job_view = dict(job)
+        job_view["last_log"] = job["log"][-1] if job["log"] else ""
+        events_broker.publish({"type": "job", "job": job_view, "ts": time.time()})
 
-    def log(msg):
+    def log(msg: str):
         job["log"].append(msg)
         publish()
 
-    def set_progress(done_bytes):
+    def set_progress(done_bytes: int):
         job["bytes"] = done_bytes
         if job["size"] > 0:
             job["percent"] = max(0.0, min(100.0, (done_bytes / job["size"]) * 100))
@@ -164,78 +167,46 @@ def start_wipe_job(name: str, level: str):
         try:
             # --- Select method by media type & level ---
             if rot:
-                # HDD
+                # ===== HDD PATHS =====
                 if level == "low":
-                    job["method"] = "dd zero (1 pass)"
-                    cmd = ["dd", f"if=/dev/zero", f"of={dev}", "bs=16M", "oflag=direct", "status=progress"]
+                    job["method"] = "dd zero (1 pass) via wipectl"
+                    cmd = ["sudo", "-n", "/usr/local/bin/wipectl", "hdd-zero", dev]
                     rc = stream_cmd(cmd, set_progress, log)
+
                 elif level == "med":
-                    job["method"] = "dd zero (1) + dd random (1)"
-                    # zeros
-                    rc = stream_cmd(["dd", "if=/dev/zero", f"of={dev}", "bs=16M", "oflag=direct", "status=progress"], set_progress, log)
-                    if rc != 0: raise RuntimeError("zero pass failed")
-                    # random
-                    rc = stream_cmd(["dd", "if=/dev/urandom", f"of={dev}", "bs=4M", "oflag=direct", "status=progress"], set_progress, log)
+                    job["method"] = "zero + random (2 passes) via wipectl"
+                    # zero pass
+                    rc = stream_cmd(["sudo", "-n", "/usr/local/bin/wipectl", "hdd-zero", dev], set_progress, log)
+                    if rc != 0:
+                        raise RuntimeError("zero pass failed")
+                    # random pass
+                    rc = stream_cmd(["sudo", "-n", "/usr/local/bin/wipectl", "hdd-random", dev], set_progress, log)
+
                 else:
-                    job["method"] = "shred -v -n 7 -z (DoD-like)"
-                    cmd = ["shred", "-v", "-n", "7", "-z", dev]
+                    job["method"] = "DoD 7-pass via wipectl (shred)"
+                    cmd = ["sudo", "-n", "/usr/local/bin/wipectl", "hdd-dod", dev]
                     rc = stream_cmd(cmd, set_progress, log)
+
             else:
-                # SSD
+                # ===== SSD PATHS =====
                 if level == "low":
-                    job["method"] = "blkdiscard (full device TRIM)"
+                    job["method"] = "blkdiscard via wipectl"
                     log("Running blkdiscard (no incremental progress)")
-                    rc = subprocess.call(["blkdiscard", dev])
+                    rc = subprocess.call(["sudo", "-n", "/usr/local/bin/wipectl", "ssd-discard", dev])
                     if rc == 0:
                         set_progress(size)
+
                 elif level == "med":
-                    job["method"] = "blkdiscard + dd zero (1)"
-                    log("blkdiscard (phase 1)")
-                    rc = subprocess.call(["blkdiscard", dev])
-                    if rc != 0: raise RuntimeError("blkdiscard failed")
-                    log("dd zero (phase 2)")
-                    rc = stream_cmd(["dd", "if=/dev/zero", f"of={dev}", "bs=16M", "oflag=direct", "status=progress"], set_progress, log)
+                    job["method"] = "blkdiscard + dd zero via wipectl"
+                    # helper does discard then dd zero; dd progress is parsed
+                    rc = stream_cmd(["sudo", "-n", "/usr/local/bin/wipectl", "ssd-discard-zero", dev], set_progress, log)
+
                 else:
-                    # Try ATA Secure Erase; fall back if unsupported
-                    job["method"] = "hdparm secure-erase (enhanced if avail) or fallback to blkdiscard"
-                    log("Checking drive security state...")
-                    try:
-                        sec = subprocess.check_output(["hdparm", "-I", dev], text=True, stderr=subprocess.STDOUT)
-                    except Exception as e:
-                        sec = str(e)
-                    frozen = "not\tenabled" not in sec and "frozen" in sec.lower()
-                    enhanced = "Enhanced erase" in sec
-
-                    if "supported" in sec and "enabled" in sec:
-                        # If security already enabled with unknown password, we cannot proceed safely.
-                        log("Security feature set is already ENABLED; cannot set temp password safely. Falling back.")
-                        rc = 1
-                    else:
-                        # Try to set a temp password and erase
-                        try:
-                            subprocess.check_call(["hdparm", "--user-master", "u", "--security-set-pass", "p3lt3ch", dev])
-                            if enhanced:
-                                log("Running hdparm --security-erase-enhanced ... (no incremental progress)")
-                                rc = subprocess.call(["hdparm", "--user-master", "u", "--security-erase-enhanced", "p3lt3ch", dev])
-                            else:
-                                log("Running hdparm --security-erase ... (no incremental progress)")
-                                rc = subprocess.call(["hdparm", "--user-master", "u", "--security-erase", "p3lt3ch", dev])
-                            # Clear password if needed
-                            try:
-                                subprocess.call(["hdparm", "--user-master", "u", "--security-disable", "p3lt3ch", dev])
-                            except Exception:
-                                pass
-                            if rc == 0:
-                                set_progress(size)
-                        except subprocess.CalledProcessError as e:
-                            log(f"hdparm secure erase failed: {e}")
-                            rc = 1
-
-                    if rc != 0:
-                        log("Falling back to blkdiscard")
-                        rc = subprocess.call(["blkdiscard", dev])
-                        if rc == 0:
-                            set_progress(size)
+                    job["method"] = "secure erase via wipectl (fallback blkdiscard)"
+                    log("Attempting ATA Secure Erase (no incremental progress); will fall back if unsupported.")
+                    rc = subprocess.call(["sudo", "-n", "/usr/local/bin/wipectl", "ssd-secure-erase", dev])
+                    if rc == 0:
+                        set_progress(size)
 
             if rc == 0:
                 job["status"] = "done"
@@ -243,6 +214,7 @@ def start_wipe_job(name: str, level: str):
             else:
                 job["status"] = "error"
                 publish()
+
         except Exception as ex:
             job["status"] = f"error: {ex}"
             publish()
@@ -256,7 +228,6 @@ def start_wipe_job(name: str, level: str):
     th.start()
     publish()
     return job
-
 
 def stream_cmd(cmd, progress_cb, line_cb=None):
     """
