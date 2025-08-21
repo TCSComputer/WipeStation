@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 import subprocess
+import re
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template, request
