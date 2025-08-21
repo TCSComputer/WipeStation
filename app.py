@@ -22,6 +22,8 @@ state_lock = threading.Lock()
 disks = {}   # key: "sdb", value: dict with details
 events_broker = None  # initialized below
 
+DEDUP_WINDOW_SEC = 2.0
+last_events = {}  # name -> {"type": str, "ts": float}
 
 def run_cmd_json(cmd):
     out = subprocess.check_output(cmd, text=True)
@@ -92,54 +94,88 @@ class EventBroker:
                 except queue.Full:
                     pass
 
+def should_publish(name: str, action: str) -> bool:
+    """
+    Return False if we saw the same action for this disk within DEDUP_WINDOW_SEC.
+    """
+    now = time.time()
+    le = last_events.get(name)
+    if le and le["type"] == action and (now - le["ts"]) < DEDUP_WINDOW_SEC:
+        return False
+    last_events[name] = {"type": action, "ts": now}
+    return True
+
 
 def udev_monitor_thread():
     """
-    Watches for block device add/remove using pyudev and updates state.
+    Watches for block device add/remove/change and emits de-duplicated events.
     """
     context = pyudev.Context()
     monitor = pyudev.Monitor.from_netlink(context)
     monitor.filter_by("block")
+
     for device in iter(monitor.poll, None):
         try:
             action = device.action  # 'add', 'remove', 'change'
             devtype = device.get("DEVTYPE")  # 'disk', 'partition'
-            name = device.sys_name  # e.g. 'sdb' or 'sdb1'
+            name = device.sys_name  # e.g. 'sdb'
 
-            # We only care about whole disks, not partitions
+            # Only whole disks
             if devtype != "disk":
                 continue
-            # Ignore protected and non-physical names
+            # Never consider protected/non-physical
             if name in PROTECTED_DISKS or name.startswith(IGNORE_PREFIXES):
                 continue
 
+            # Debounce: skip rapid duplicates of the same action
+            if not should_publish(name, action):
+                continue
+
             if action == "add":
-                # Refresh details for this disk
-                new_snapshot = scan_disks()
+                # If we already know this disk, suppress duplicate add
                 with state_lock:
-                    # Merge single disk (if present) into state
-                    if name in new_snapshot:
-                        disks[name] = new_snapshot[name]
-                        evt = {"type": "add", "disk": disks[name], "ts": time.time()}
-                        events_broker.publish(evt)
+                    already = name in disks
+                if already:
+                    # treat as a change/update instead
+                    snapshot = scan_disks()
+                    with state_lock:
+                        if name in snapshot:
+                            disks[name] = snapshot[name]
+                            events_broker.publish({"type": "change", "disk": disks[name], "ts": time.time()})
+                    continue
+
+                snapshot = scan_disks()
+                with state_lock:
+                    if name in snapshot:
+                        disks[name] = snapshot[name]
+                        events_broker.publish({"type": "add", "disk": disks[name], "ts": time.time()})
+
+            elif action == "change":
+                # Sometimes only 'change' fires on first init; treat as add if unknown
+                snapshot = scan_disks()
+                with state_lock:
+                    if name not in snapshot:
+                        # nothing to do
+                        continue
+                    first_time = name not in disks
+                    disks[name] = snapshot[name]
+                    events_broker.publish({
+                        "type": "add" if first_time else "change",
+                        "disk": disks[name],
+                        "ts": time.time()
+                    })
 
             elif action == "remove":
                 with state_lock:
                     if name in disks:
                         removed = disks.pop(name)
-                        evt = {"type": "remove", "disk": removed, "ts": time.time()}
-                        events_broker.publish(evt)
+                        events_broker.publish({"type": "remove", "disk": removed, "ts": time.time()})
+                # clear last-event tracking so a new insert isn't throttled
+                last_events.pop(name, None)
 
-            elif action == "change":
-                # Re-scan this disk’s info
-                snapshot = scan_disks()
-                with state_lock:
-                    if name in snapshot:
-                        disks[name] = snapshot[name]
-                        evt = {"type": "change", "disk": disks[name], "ts": time.time()}
-                        events_broker.publish(evt)
         except Exception as e:
             print(f"[udev_monitor_thread] Error: {e}")
+
 
 
 @app.route("/")
