@@ -154,6 +154,7 @@ def start_wipe_job(name: str, level: str):
         events_broker.publish({"type": "job", "job": job_view, "ts": time.time()})
 
     def log(msg: str):
+        print(f"[JOB {name}] {msg}", flush=True)  # <-- console log
         job["log"].append(msg)
         publish()
 
@@ -161,6 +162,8 @@ def start_wipe_job(name: str, level: str):
         job["bytes"] = done_bytes
         if job["size"] > 0:
             job["percent"] = max(0.0, min(100.0, (done_bytes / job["size"]) * 100))
+        # console debug
+        print(f"[JOB {name}] progress {job['percent']:.1f}% ({job['bytes']}/{job['size']} bytes)", flush=True)
         publish()
 
     def worker():
