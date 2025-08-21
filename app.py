@@ -29,14 +29,13 @@ def run_cmd_json(cmd):
 
 
 def scan_disks():
-    """
-    Returns a dict of current disks keyed by name (e.g. sdb).
-    Uses lsblk JSON output and filters to real disks.
-    """
     result = {}
     try:
-        data = run_cmd_json(["lsblk", "-J", "-O", "-o",
-                             "NAME,TYPE,SIZE,MODEL,SERIAL,VENDOR,WWN,TRAN,MOUNTPOINT,RM,RO,STATE"])
+        # OLD (bad): ["lsblk", "-J", "-O", "-o", "..."]
+        data = run_cmd_json([
+            "lsblk", "-J",
+            "-o", "NAME,TYPE,SIZE,MODEL,SERIAL,VENDOR,WWN,TRAN,STATE"
+        ])
         for blk in data.get("blockdevices", []):
             if blk.get("type") != "disk":
                 continue
@@ -54,14 +53,15 @@ def scan_disks():
                 "serial": (blk.get("serial") or "").strip(),
                 "vendor": (blk.get("vendor") or "").strip(),
                 "wwn": (blk.get("wwn") or "").strip(),
-                "tran": (blk.get("tran") or "").strip(),  # sata, usb, etc.
-                "state": (blk.get("state") or "").strip(),
+                "tran": (blk.get("tran") or "").strip(),    # sata/usb/etc
+                "state": (blk.get("state") or "").strip(),  # may be empty on some devices
                 "protected": name in PROTECTED_DISKS,
             }
             result[name] = info
     except Exception as e:
         print(f"[scan_disks] Error: {e}")
     return result
+
 
 
 class EventBroker:
