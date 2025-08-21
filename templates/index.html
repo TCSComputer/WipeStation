@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Secure Wipe Station — Drive Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Secure Wipe Station — Drive Monitor</h1>
+    <p>Protected boot disks: <code id="protected"></code></p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Connected Drives</h2>
+      <div class="table-wrap">
+        <table id="drives">
+          <thead>
+            <tr>
+              <th>Device</th>
+              <th>Size</th>
+              <th>Model</th>
+              <th>Serial</th>
+              <th>Bus</th>
+              <th>State</th>
+              <th>Protected</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">Hot-plug a SATA HDD/SSD in the bay — it should appear here instantly.</p>
+    </section>
+
+    <section class="card">
+      <h2>Events</h2>
+      <ul id="events" class="events"></ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
