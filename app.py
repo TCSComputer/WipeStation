@@ -225,6 +225,10 @@ def main():
     # Initial disk inventory
     bootstrap_initial_state()
 
+    # prevent immediate throttling on startup snapshot
+    for _name in list(disks.keys()):
+        last_events.pop(_name, None)
+
     # Start udev watcher
     t = threading.Thread(target=udev_monitor_thread, daemon=True)
     t.start()
