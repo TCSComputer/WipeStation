@@ -4,6 +4,7 @@ const eventsEl = document.querySelector("#events");
 
 function fmtDiskRow(d) {
   const prot = d.protected ? '<span class="badge yes">YES</span>' : '<span class="badge no">NO</span>';
+  const disabled = d.protected ? 'disabled' : '';
   return `
     <tr id="row-${d.name}">
       <td><code>${d.path}</code></td>
@@ -13,8 +14,62 @@ function fmtDiskRow(d) {
       <td>${d.tran || ""}</td>
       <td>${d.state || ""}</td>
       <td>${prot}</td>
+      <td>
+        <div>
+          <button class="btn act" data-disk="${d.name}" data-level="low" ${disabled}>Low</button>
+          <button class="btn act" data-disk="${d.name}" data-level="med" ${disabled}>Med</button>
+          <button class="btn act" data-disk="${d.name}" data-level="high" ${disabled}>High</button>
+        </div>
+        <div class="progress"><div class="bar" id="bar-${d.name}" style="width:0%"></div></div>
+        <div class="small" id="meta-${d.name}"></div>
+      </td>
     </tr>`;
 }
+
+async function startWipe(name, level) {
+  const res = await fetch(`/api/wipe/${name}?level=${level}`, {method: "POST"});
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest(".act");
+  if (!b) return;
+  const disk = b.dataset.disk;
+  const level = b.dataset.level;
+  if (!confirm(`Start ${level.toUpperCase()} wipe on /dev/${disk}? This will destroy all data.`)) return;
+  startWipe(disk, level);
+});
+
+function initJobSSE() {
+  const es = new EventSource("/events/jobs");
+  es.onmessage = (msg) => {
+    const evt = JSON.parse(msg.data);
+    if (evt.type === "jobs_snapshot") {
+      evt.jobs.forEach(updateJobUI);
+    } else if (evt.type === "job") {
+      updateJobUI(evt.job);
+    }
+  };
+  es.onerror = () => setTimeout(initJobSSE, 1500);
+}
+
+function updateJobUI(job) {
+  const bar = document.getElementById(`bar-${job.disk}`);
+  const meta = document.getElementById(`meta-${job.disk}`);
+  if (!bar || !meta) return;
+  const pct = (job.percent || 0).toFixed(1);
+  bar.style.width = `${pct}%`;
+  const sz = job.size ? ` / ${((job.size)/1e9).toFixed(1)} GB` : "";
+  meta.textContent = `[${job.level.toUpperCase()} • ${job.method || "…" }] ${pct}% — ${job.bytes ? (job.bytes/1e9).toFixed(2)+" GB" : "…" }${sz} — ${job.status}`;
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+  await refreshOnce();
+  initSSE();      // disk add/remove
+  initJobSSE();   // job progress
+});
+
 
 function renderSnapshot(disks, protectedList) {
   protectedEl.textContent = protectedList.join(", ") || "(none)";

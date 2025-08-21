@@ -27,9 +27,18 @@
               <th>Bus</th>
               <th>State</th>
               <th>Protected</th>
+              <th>Actions</th>
             </tr>
           </thead>
-          <tbody></tbody>
+          <tbody>
+          <td>
+            <button class="btn" data-level="low"  data-disk="{{name}}">Low</button>
+            <button class="btn" data-level="med"  data-disk="{{name}}">Med</button>
+            <button class="btn" data-level="high" data-disk="{{name}}">High</button>
+            <div class="progress"><div class="bar" id="bar-{{name}}" style="width:0%"></div></div>
+            <div class="small" id="meta-{{name}}"></div>
+          </td>
+          </tbody>
         </table>
       </div>
       <p class="hint">Hot-plug a SATA HDD/SSD in the bay — it should appear here instantly.</p>

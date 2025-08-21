@@ -6,7 +6,7 @@ import time
 import subprocess
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, request
 import pyudev
 
 app = Flask(__name__)
@@ -24,6 +24,10 @@ events_broker = None  # initialized below
 
 DEDUP_WINDOW_SEC = 2.0
 last_events = {}  # name -> {"type": str, "ts": float}
+
+# Wipe job tracking
+job_lock = threading.Lock()
+jobs = {}  # key: disk name -> job dict
 
 def run_cmd_json(cmd):
     out = subprocess.check_output(cmd, text=True)
@@ -104,6 +108,177 @@ def should_publish(name: str, action: str) -> bool:
         return False
     last_events[name] = {"type": action, "ts": now}
     return True
+
+def is_rotational(name: str) -> bool:
+    try:
+        with open(f"/sys/block/{name}/queue/rotational", "r") as f:
+            return f.read().strip() == "1"
+    except Exception:
+        return True  # assume HDD if unknown
+
+def device_size_bytes(devpath: str) -> int:
+    # Use blockdev --getsize64 for exact bytes
+    try:
+        out = subprocess.check_output(["blockdev", "--getsize64", devpath], text=True).strip()
+        return int(out)
+    except Exception:
+        return 0
+
+def start_wipe_job(name: str, level: str):
+    if name in PROTECTED_DISKS:
+        raise RuntimeError("Refusing to wipe a protected disk")
+    dev = f"/dev/{name}"
+    rot = is_rotational(name)
+    size = device_size_bytes(dev)
+
+    job = {
+        "disk": name,
+        "device": dev,
+        "level": level,
+        "rotational": rot,
+        "size": size,
+        "started": time.time(),
+        "bytes": 0,
+        "percent": 0.0,
+        "status": "running",
+        "log": [],
+        "pid": None,
+        "method": None,
+    }
+
+    def publish():
+        events_broker.publish({"type": "job", "job": {k: (int(v) if isinstance(v, bool) else v) for k, v in job.items()}, "ts": time.time()})
+
+    def log(msg):
+        job["log"].append(msg)
+        publish()
+
+    def set_progress(done_bytes):
+        job["bytes"] = done_bytes
+        if job["size"] > 0:
+            job["percent"] = max(0.0, min(100.0, (done_bytes / job["size"]) * 100))
+        publish()
+
+    def worker():
+        try:
+            # --- Select method by media type & level ---
+            if rot:
+                # HDD
+                if level == "low":
+                    job["method"] = "dd zero (1 pass)"
+                    cmd = ["dd", f"if=/dev/zero", f"of={dev}", "bs=16M", "oflag=direct", "status=progress"]
+                    rc = stream_cmd(cmd, set_progress, log)
+                elif level == "med":
+                    job["method"] = "dd zero (1) + dd random (1)"
+                    # zeros
+                    rc = stream_cmd(["dd", "if=/dev/zero", f"of={dev}", "bs=16M", "oflag=direct", "status=progress"], set_progress, log)
+                    if rc != 0: raise RuntimeError("zero pass failed")
+                    # random
+                    rc = stream_cmd(["dd", "if=/dev/urandom", f"of={dev}", "bs=4M", "oflag=direct", "status=progress"], set_progress, log)
+                else:
+                    job["method"] = "shred -v -n 7 -z (DoD-like)"
+                    cmd = ["shred", "-v", "-n", "7", "-z", dev]
+                    rc = stream_cmd(cmd, set_progress, log)
+            else:
+                # SSD
+                if level == "low":
+                    job["method"] = "blkdiscard (full device TRIM)"
+                    log("Running blkdiscard (no incremental progress)")
+                    rc = subprocess.call(["blkdiscard", dev])
+                    if rc == 0:
+                        set_progress(size)
+                elif level == "med":
+                    job["method"] = "blkdiscard + dd zero (1)"
+                    log("blkdiscard (phase 1)")
+                    rc = subprocess.call(["blkdiscard", dev])
+                    if rc != 0: raise RuntimeError("blkdiscard failed")
+                    log("dd zero (phase 2)")
+                    rc = stream_cmd(["dd", "if=/dev/zero", f"of={dev}", "bs=16M", "oflag=direct", "status=progress"], set_progress, log)
+                else:
+                    # Try ATA Secure Erase; fall back if unsupported
+                    job["method"] = "hdparm secure-erase (enhanced if avail) or fallback to blkdiscard"
+                    log("Checking drive security state...")
+                    try:
+                        sec = subprocess.check_output(["hdparm", "-I", dev], text=True, stderr=subprocess.STDOUT)
+                    except Exception as e:
+                        sec = str(e)
+                    frozen = "not\tenabled" not in sec and "frozen" in sec.lower()
+                    enhanced = "Enhanced erase" in sec
+
+                    if "supported" in sec and "enabled" in sec:
+                        # If security already enabled with unknown password, we cannot proceed safely.
+                        log("Security feature set is already ENABLED; cannot set temp password safely. Falling back.")
+                        rc = 1
+                    else:
+                        # Try to set a temp password and erase
+                        try:
+                            subprocess.check_call(["hdparm", "--user-master", "u", "--security-set-pass", "p3lt3ch", dev])
+                            if enhanced:
+                                log("Running hdparm --security-erase-enhanced ... (no incremental progress)")
+                                rc = subprocess.call(["hdparm", "--user-master", "u", "--security-erase-enhanced", "p3lt3ch", dev])
+                            else:
+                                log("Running hdparm --security-erase ... (no incremental progress)")
+                                rc = subprocess.call(["hdparm", "--user-master", "u", "--security-erase", "p3lt3ch", dev])
+                            # Clear password if needed
+                            try:
+                                subprocess.call(["hdparm", "--user-master", "u", "--security-disable", "p3lt3ch", dev])
+                            except Exception:
+                                pass
+                            if rc == 0:
+                                set_progress(size)
+                        except subprocess.CalledProcessError as e:
+                            log(f"hdparm secure erase failed: {e}")
+                            rc = 1
+
+                    if rc != 0:
+                        log("Falling back to blkdiscard")
+                        rc = subprocess.call(["blkdiscard", dev])
+                        if rc == 0:
+                            set_progress(size)
+
+            if rc == 0:
+                job["status"] = "done"
+                set_progress(size if size else job["bytes"])
+            else:
+                job["status"] = "error"
+                publish()
+        except Exception as ex:
+            job["status"] = f"error: {ex}"
+            publish()
+
+    with job_lock:
+        if name in jobs and jobs[name]["status"] == "running":
+            raise RuntimeError("A wipe is already running for this disk")
+        jobs[name] = job
+
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    publish()
+    return job
+
+
+def stream_cmd(cmd, progress_cb, line_cb=None):
+    """
+    Run a command and stream stderr for progress parsing.
+    dd writes progress to stderr with 'status=progress'.
+    shred -v writes bytes/pass info to stderr.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    total_bytes = None
+    # Read stderr live
+    for line in proc.stderr:
+        if line_cb:
+            line_cb(line)
+        # Try to catch dd status lines like: '123456789 bytes (123 MB, ...) copied'
+        m = re.search(r'(\d+)\s+bytes', line)
+        if m:
+            try:
+                done = int(m.group(1))
+                progress_cb(done)
+            except Exception:
+                pass
+    proc.wait()
+    return proc.returncode
 
 
 def udev_monitor_thread():
@@ -211,6 +386,43 @@ def sse():
 
     return Response(stream(), mimetype="text/event-stream")
 
+
+@app.route("/api/wipe/<name>", methods=["POST"])
+def api_wipe(name):
+    level = request.args.get("level", "low").lower()
+    if level not in ("low", "med", "high"):
+        return jsonify({"error": "level must be one of: low, med, high"}), 400
+    if name in PROTECTED_DISKS:
+        return jsonify({"error": "protected disk"}), 400
+    try:
+        job = start_wipe_job(name, level)
+        return jsonify({"job": job})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/jobs")
+def api_jobs():
+    with job_lock:
+        return jsonify({"jobs": list(jobs.values())})
+
+@app.route("/events/jobs")
+def sse_jobs():
+    def stream():
+        q = events_broker.register()
+        try:
+            # send initial
+            with job_lock:
+                snapshot = list(jobs.values())
+            yield f"data: {json.dumps({'type': 'jobs_snapshot', 'jobs': snapshot, 'ts': time.time()})}\n\n"
+            while True:
+                evt = q.get()
+                if evt.get("type") in ("job",):
+                    yield f"data: {json.dumps(evt)}\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            events_broker.unregister(q)
+    return Response(stream(), mimetype="text/event-stream")
 
 def bootstrap_initial_state():
     with state_lock:
