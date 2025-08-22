@@ -4,6 +4,10 @@
 # - SSE event streams for disks and jobs
 # - Wipe job orchestration via root-only helper (/usr/local/bin/wipectl)
 
+# --- certificate printing (import the local module "print.py" safely) ---
+import importlib
+from pathlib import Path
+
 import os
 import re
 import json
@@ -21,6 +25,15 @@ import pyudev
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
+
+tcsprint = importlib.import_module("print")  # this is your print.py
+
+# Template & output paths
+TEMPLATE_PATH = Path.cwd() / "wipe_cert.pdf"           # your uploaded template, cwd as requested
+CERT_OUT_DIR  = Path("/var/log/tcs-wiper/certs")       # archive location for PDFs
+
+# Printer to use (None = default CUPS printer)
+DEFAULT_PRINTER = None   # e.g., "HP_LaserJet_Pro_M127fn" if you want to force a specific one
 
 app = Flask(__name__)
 
@@ -403,6 +416,75 @@ def sse_jobs():
             events_broker.unregister(q)
     return Response(stream(), mimetype="text/event-stream")
 
+def human_size_gb(nbytes: int) -> str:
+    try:
+        return f"{(int(nbytes)/1e9):.1f} GB"
+    except Exception:
+        return "Unknown"
+
+def generate_and_print_certificate(job: dict, printer: str | None = DEFAULT_PRINTER) -> bool:
+    """
+    Render a certificate PDF using print.py overlay + send to CUPS.
+    Stores job['certificate'] (path) and job['cert_id'] if successful.
+    """
+    try:
+        # Sanity checks
+        if not TEMPLATE_PATH.exists():
+            raise FileNotFoundError(f"Template not found: {TEMPLATE_PATH}")
+
+        CERT_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Build data for overlay
+        started_ts  = job.get("started") or time.time()
+        finished_ts = time.time()
+        started  = time.strftime("%Y-%m-%d %H:%M", time.localtime(started_ts))
+        finished = time.strftime("%Y-%m-%d %H:%M", time.localtime(finished_ts))
+        size_txt = human_size_gb(job.get("size", 0))
+        op = os.getenv("SUDO_USER") or os.getenv("USER") or "TCS"
+
+        # Cert ID: date + short job id
+        cert_id = f"CERT-{time.strftime('%Y%m%d', time.localtime(finished_ts))}-{job['id'][:8].upper()}"
+
+        data = {
+            "MODEL":    job.get("model", "") or "",
+            "SERIAL":   job.get("serial", "") or "",
+            "CAPACITY": size_txt,
+            "LEVEL":    (job.get("level") or "").capitalize(),
+            "METHOD":   job.get("method", "") or "",
+            "STARTED":  started,
+            "FINISHED": finished,
+            "RESULT":   "SUCCESS" if job.get("status") == "done" else "FAILED",
+            "OPERATOR": op,
+            "CERT_ID":  cert_id,
+        }
+
+        # Output path
+        serial_safe = (data["SERIAL"] or "unknown").replace("/", "_").replace(" ", "_")
+        out_path = CERT_OUT_DIR / f"cert-{serial_safe}-{job['id']}.pdf"
+
+        # Render overlay and write file
+        geom = tcsprint.detect_template_geometry(str(TEMPLATE_PATH))
+        tcsprint.render_overlay(
+            geom=geom,
+            template_path=str(TEMPLATE_PATH),
+            out_path=str(out_path),
+            data=data,
+            dx=0, dy=0,            # use your tuned coords from print.py as-is
+            debug=False, grid=False, crosshair=False, rulers=False
+        )
+
+        # Send to printer (CUPS)
+        tcsprint.send_to_printer(str(out_path), printer=printer)
+
+        # Stash references on the job for UI/logging
+        job["certificate"] = str(out_path)
+        job["cert_id"] = cert_id
+        return True
+
+    except Exception as e:
+        print(f"[JOB {job.get('disk')}] certificate generation failed: {e}", flush=True)
+        job["certificate_error"] = str(e)
+        return False
 
 def start_wipe_job(name: str, level: str):
     if name in PROTECTED_DISKS:
@@ -531,6 +613,20 @@ def start_wipe_job(name: str, level: str):
             # finalize status
             if rc == 0:
                 job["status"] = "done"
+
+                if rc == 0:
+                    job["status"] = "done"
+                    if job["size"] and job["bytes"] < job["size"]:
+                        set_progress(job["size"])
+
+                    # >>> Generate + print certificate <<<
+                    generate_and_print_certificate(job, printer=DEFAULT_PRINTER)
+
+                    publish()
+                else:
+                    job["status"] = "error"
+                    publish()
+
                 # ensure bar reaches 100% for UI
                 if job["size"] and job["bytes"] < job["size"]:
                     set_progress(job["size"])
@@ -545,7 +641,7 @@ def start_wipe_job(name: str, level: str):
         finally:
             # persist log line for audit (JSONL monthly file)
             try:
-                logdir = Path("/var/log/TCS-wiper")
+                logdir = Path("/var/log/tcs-wiper")
                 logdir.mkdir(parents=True, exist_ok=True)
                 job_copy = dict(job)
                 job_copy["finished"] = time.time()
