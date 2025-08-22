@@ -14,7 +14,7 @@ const jfPrintEl   = document.getElementById("jf-print");
 const runningByDisk = new Map();
 
 function bytesToGB(n) {
-  if (!n || isNaN(n)) return "";
+  if (n == null || isNaN(n)) return "";
   return (n / 1e9).toFixed(1) + " GB";
 }
 
@@ -34,14 +34,16 @@ function fmtDiskRow(d) {
       <td>${d.tran || ""}</td>
       <td>${d.state || ""}</td>
       <td>${prot}</td>
-      <td>
-        <div>
-          <button class="btn act" data-disk="${d.name}" data-level="low"  ${disabled} ${jobRunning}>Low</button>
-          <button class="btn act" data-disk="${d.name}" data-level="med"  ${disabled} ${jobRunning}>Med</button>
-          <button class="btn act" data-disk="${d.name}" data-level="high" ${disabled} ${jobRunning}>High</button>
+      <td class="actions">
+        <div class="actions-stack">
+          <div>
+            <button class="btn act" data-disk="${d.name}" data-level="low"  ${disabled} ${jobRunning}>Low</button>
+            <button class="btn act" data-disk="${d.name}" data-level="med"  ${disabled} ${jobRunning}>Med</button>
+            <button class="btn act" data-disk="${d.name}" data-level="high" ${disabled} ${jobRunning}>High</button>
+          </div>
+          <div class="progress"><div class="bar" id="bar-${d.name}" style="width:0%"></div></div>
+          <div class="small" id="meta-${d.name}"></div>
         </div>
-        <div class="progress"><div class="bar" id="bar-${d.name}" style="width:0%"></div></div>
-        <div class="small" id="meta-${d.name}"></div>
       </td>
     </tr>`;
 }
@@ -102,7 +104,7 @@ function renderMeta(job) {
   const state  = (job.status || "").toString();
   const stateClass = state.startsWith("error") ? "error" : (state === "done" ? "done" : "running");
 
-  // Optionally suppress noisy '... bytes copied ...' lines in the tail
+  // Suppress noisy '... bytes copied ...' lines in the tail
   const noisy = /(\d+)\s+bytes.*copied|records in|records out/i;
   const last  = job.last_log && !noisy.test(job.last_log) ? job.last_log : "";
 
@@ -122,24 +124,25 @@ function renderMeta(job) {
 function updateJobUI(job) {
   const bar  = document.getElementById(`bar-${job.disk}`);
   const meta = document.getElementById(`meta-${job.disk}`);
-  if (!bar || !meta) return;
+  const row  = document.getElementById(`row-${job.disk}`);
+  if (!bar || !meta || !row) return;
 
   const pctNum = (job.percent || 0);
   bar.style.width = `${pctNum.toFixed(1)}%`;
-
   meta.innerHTML = renderMeta(job);
 
-  // Disable/enable action buttons while running
+  // Row height/disabled buttons while running
   if (job.status === "running") {
     runningByDisk.set(job.disk, true);
     updateRowDisabled(job.disk, true);
+    row.classList.add("row-job");
   } else if (job.status === "done" || String(job.status).startsWith("error")) {
     runningByDisk.set(job.disk, false);
     updateRowDisabled(job.disk, false);
+    row.classList.remove("row-job");
     showFinished(job);
   }
 }
-
 
 function showFinished(job) {
   if (!modalEl) return;
@@ -226,7 +229,6 @@ function initDiskSSE() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  // Avoid duplicate init (your previous file initialized twice)
   await refreshOnce();
   initDiskSSE();
   initJobSSE();
