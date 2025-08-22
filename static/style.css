@@ -43,3 +43,24 @@ td code { background: #101633; padding: 2px 6px; border-radius: 6px; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .badge.serial4 { background: #24335e; border: 1px solid #2d3e6e; margin-left: 6px; }
+
+#events li { white-space: normal; word-break: break-word; }
+
+/* Job meta card */
+.meta-block {
+  background: #0f1530;
+  border: 1px solid #24335e;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-top: 6px;
+  line-height: 1.35;
+  max-width: 620px; /* keep it tidy */
+  white-space: normal;
+  word-break: break-word;
+}
+.meta-line { margin: 2px 0; }
+
+.badge.state { padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid transparent; }
+.badge.state.running { background: #1a2e57; border-color: #22407c; color: #cfe1ff; }
+.badge.state.done    { background: #14361f; border-color: #1e5a33; color: #bff3ce; }
+.badge.state.error   { background: #3a171a; border-color: #6f2b32; color: #ffc4c9; }

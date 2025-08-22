@@ -200,13 +200,17 @@ class EventBroker:
             if q in self.clients:
                 self.clients.remove(q)
 
-    def publish(self, event):
-        with self.lock:
-            for q in list(self.clients):
-                try:
-                    q.put_nowait(event)
-                except queue.Full:
-                    pass
+    def publish():
+        job_view = dict(job)
+        noisy = re.compile(r'(\d+)\s+bytes.*copied|records in|records out', re.I)
+        # find the last non-noisy log line
+        last_clean = ""
+        for line in reversed(job["log"]):
+            if not noisy.search(line or ""):
+                last_clean = line
+                break
+        job_view["last_log"] = last_clean
+        events_broker.publish({"type": "job", "job": job_view, "ts": time.time()})
 
 
 # ------------------------------------------------------------------------------

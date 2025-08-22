@@ -93,27 +93,43 @@ function initJobSSE() {
   es.onerror = () => setTimeout(initJobSSE, 1500);
 }
 
+function renderMeta(job) {
+  const pct    = (job.percent || 0).toFixed(1) + "%";
+  const doneGB = job.bytes ? (job.bytes / 1e9).toFixed(2) + " GB" : "…";
+  const sizeGB = job.size ? (job.size / 1e9).toFixed(1) + " GB" : "unknown";
+  const spd    = job.mbps ? `${job.mbps.toFixed(1)} MB/s` : "–";
+  const eta    = (job.eta_sec != null) ? `${Math.max(0, Math.floor(job.eta_sec/60))}m` : "–";
+  const state  = (job.status || "").toString();
+  const stateClass = state.startsWith("error") ? "error" : (state === "done" ? "done" : "running");
+
+  // Optionally suppress noisy '... bytes copied ...' lines in the tail
+  const noisy = /(\d+)\s+bytes.*copied|records in|records out/i;
+  const last  = job.last_log && !noisy.test(job.last_log) ? job.last_log : "";
+
+  return `
+    <div class="meta-block">
+      <div class="meta-line"><strong>[${(job.level||"?").toUpperCase()} • ${job.method || "…"}]</strong></div>
+      <div class="meta-line">${doneGB} / ${sizeGB} — ${pct}</div>
+      <div class="meta-line">
+        <span class="badge state ${stateClass}">${state}</span>
+        ${spd !== "–" ? ` • ${spd}` : ""}${eta !== "–" ? ` • ETA ${eta}` : ""}
+      </div>
+      ${last ? `<div class="meta-line small">${last}</div>` : ""}
+    </div>
+  `;
+}
+
 function updateJobUI(job) {
-  // job contains: disk, size, bytes, percent, status, level, method, mbps, eta_sec, last_log, model, serial
   const bar  = document.getElementById(`bar-${job.disk}`);
   const meta = document.getElementById(`meta-${job.disk}`);
   if (!bar || !meta) return;
 
-  const pct = (job.percent || 0).toFixed(1);
-  bar.style.width = `${pct}%`;
+  const pctNum = (job.percent || 0);
+  bar.style.width = `${pctNum.toFixed(1)}%`;
 
-  const doneGB = job.bytes ? (job.bytes / 1e9).toFixed(2) + " GB" : "…";
-  const sizeGB = job.size ? ` / ${(job.size / 1e9).toFixed(1)} GB` : "";
-  const spd    = job.mbps ? ` — ${job.mbps.toFixed(1)} MB/s` : "";
-  const eta    = (job.eta_sec != null) ? ` — ETA ${Math.max(0, Math.floor(job.eta_sec/60))}m` : "";
-  const last   = job.last_log ? ` — ${job.last_log}` : "";
+  meta.innerHTML = renderMeta(job);
 
-  meta.textContent =
-  `[${job.level?.toUpperCase() || "?"} • ${job.method || "…"}]\n` +
-  `${pct}% — ${doneGB}${sizeGB}\n` +
-  `${job.status}${spd}${eta}${last}`;
-
-  // Disable/enable action buttons for this disk based on job status
+  // Disable/enable action buttons while running
   if (job.status === "running") {
     runningByDisk.set(job.disk, true);
     updateRowDisabled(job.disk, true);
@@ -123,6 +139,7 @@ function updateJobUI(job) {
     showFinished(job);
   }
 }
+
 
 function showFinished(job) {
   if (!modalEl) return;
