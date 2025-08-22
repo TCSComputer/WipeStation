@@ -24,7 +24,13 @@ td code { background: #101633; padding: 2px 6px; border-radius: 6px; }
 .btn:hover { filter:brightness(1.1); }
 .progress { width:240px; height:10px; background:#0f1530; border:1px solid #24335e; border-radius:6px; margin-top:6px; overflow:hidden; display:inline-block; vertical-align:middle; }
 .bar { height:100%; background:#76b3fa; width:0%; }
-.small { font-size:12px; color:#9fb0c8; margin-top:4px; }
+
+/* Allow job status lines to wrap nicely */
+.small {
+  white-space: normal;     /* allow wrapping instead of single-line */
+  word-break: break-word;  /* break long words if necessary */
+  max-width: 600px;        /* optional: constrain how wide it can stretch */
+}
 
 /* Modal for Job Finished */
 .modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 9999; }

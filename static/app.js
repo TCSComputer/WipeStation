@@ -108,7 +108,10 @@ function updateJobUI(job) {
   const eta    = (job.eta_sec != null) ? ` — ETA ${Math.max(0, Math.floor(job.eta_sec/60))}m` : "";
   const last   = job.last_log ? ` — ${job.last_log}` : "";
 
-  meta.textContent = `[${job.level?.toUpperCase() || "?"} • ${job.method || "…"}] ${pct}% — ${doneGB}${sizeGB} — ${job.status}${spd}${eta}${last}`;
+  meta.textContent =
+  `[${job.level?.toUpperCase() || "?"} • ${job.method || "…"}]\n` +
+  `${pct}% — ${doneGB}${sizeGB}\n` +
+  `${job.status}${spd}${eta}${last}`;
 
   // Disable/enable action buttons for this disk based on job status
   if (job.status === "running") {
