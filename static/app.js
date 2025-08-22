@@ -64,23 +64,56 @@ function updateRowDisabled(disk, on) {
 }
 
 document.addEventListener("click", async (e) => {
-  const b = e.target.closest(".act");
-  if (!b) return;
-  const disk  = b.dataset.disk;
-  const level = b.dataset.level;
+  const btn = e.target.closest(".act");
+  if (!btn) return;
 
-  // Pull last 4 of serial from the row for safer confirmation
-  const serialCell = document.getElementById(`row-${disk}`)?.children?.[3]?.textContent || "";
-  const m = serialCell.match(/(\w{4})\s*$/);
-  const last4 = m ? m[1] : "";
+  const disk  = btn.dataset.disk;
+  const level = (btn.dataset.level || "").toLowerCase();
 
-  let promptMsg = `CONFIRM WIPE (${level.toUpperCase()}) on /dev/${disk}\n\nType the LAST 4 of the serial to proceed`;
-  if (last4) promptMsg += ` [${last4}]`;
+  // If a job is already running for this disk, ignore clicks
+  if (runningByDisk.get(disk)) return;
+
+  // Pull the Serial cell text (4th column in the row)
+  const row = document.getElementById(`row-${disk}`);
+  const serialCellText = row?.children?.[3]?.textContent?.trim() || "";
+
+  // Try to extract last 4 *alphanumeric* chars from the serial
+  // (handles serials with spaces/dashes/etc.)
+  const serialClean = serialCellText.replace(/[^A-Za-z0-9]/g, "");
+  const last4 = serialClean.length >= 4 ? serialClean.slice(-4) : "";
+
+  // Build confirmation prompt
+  let promptMsg;
+  if (last4) {
+    promptMsg =
+      `CONFIRM WIPE (${level.toUpperCase()}) on /dev/${disk}\n\n` +
+      `Type the LAST 4 of the serial to proceed [${last4}]`;
+  } else {
+    // Fallback when serial isn't reported
+    promptMsg =
+      `CONFIRM WIPE (${level.toUpperCase()}) on /dev/${disk}\n\n` +
+      `Serial not reported by the device.\n` +
+      `Type WIPE to proceed.`;
+  }
+
   const typed = window.prompt(promptMsg, "");
-  if (!typed || (last4 && typed.trim() !== last4)) { alert("Canceled."); return; }
+  if (typed == null) return; // user hit Cancel
+
+  if (last4) {
+    if (typed.trim() !== last4) {
+      alert("Canceled. (Last-4 did not match)");
+      return;
+    }
+  } else {
+    if (typed.trim().toUpperCase() !== "WIPE") {
+      alert('Canceled. (Please type "WIPE" to confirm when serial is unknown)');
+      return;
+    }
+  }
 
   await startWipe(disk, level);
 });
+
 
 function initJobSSE() {
   const es = new EventSource("/events/jobs");
