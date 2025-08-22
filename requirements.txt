@@ -1,2 +1,15 @@
-flask
-pyudev
+# Flask web framework
+Flask>=3.0.3
+
+# Device event monitoring
+pyudev>=0.24.1
+
+# PDF generation and overlay
+reportlab>=4.2.2
+PyPDF2>=3.0.1
+
+# For parsing / data structures
+dataclasses; python_version < "3.7"
+
+# Web requests / JSON parsing (standard in Python 3.13, but harmless to keep)
+requests>=2.32.3
