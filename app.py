@@ -59,6 +59,37 @@ disk_running = {} # disk name -> job_id (to prevent concurrent wipes on same dis
 # Global event broker for SSE
 events_broker = None
 
+# ------------------------------------------------------------------------------
+# I/O error & stall handling
+# ------------------------------------------------------------------------------
+IO_ERROR_PATTERNS = [
+    r"Input/output error",
+    r"\bI/O error\b",
+    r"end_request:\s*I/O error",
+    r"Buffer I/O error",
+    r"read error",
+    r"write error",
+    r"device offline",
+    r"cannot allocate memory for \w+ buffer",  # occasionally shows on dying HW
+]
+
+STALL_TIMEOUT_SEC = 150   # consider "stalled" if no progress for this many seconds
+KILL_GRACE_SEC    = 3     # grace between SIGTERM and SIGKILL for the job
+
+def _kill_process_group(proc: subprocess.Popen, reason: str):
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        pass
+    # short grace; if still alive, SIGKILL
+    try:
+        try:
+            proc.wait(timeout=KILL_GRACE_SEC)
+        except Exception:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+
 
 # ------------------------------------------------------------------------------
 # Utilities
@@ -336,33 +367,70 @@ def sse_disks():
 
 def stream_cmd(cmd, progress_cb, line_cb=None):
     """
-    Run a command and stream stderr lines; parse '... bytes' to update progress.
-    Return process exit code.
+    Run a command and stream stderr lines; parse '<n> bytes' to update progress.
+    Detects I/O errors and long stalls. Returns (returncode, reason) where
+    reason is one of: None, 'io_error', 'stalled'.
     """
-    # Launch in its own process group so we can cancel later if needed
+    reason = None
+    last_bytes = -1
+    last_change = time.time()
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        preexec_fn=os.setsid
+        preexec_fn=os.setsid,  # own process group for clean kill
     )
-    # track pid via the callback (caller may stash it in job dict separately)
+
+    io_err_regexes = [re.compile(pat, re.IGNORECASE) for pat in IO_ERROR_PATTERNS]
+
+    # Read stderr line-by-line
     for line in proc.stderr:
-        line = line.rstrip("\n")
+        now = time.time()
+        s = line.rstrip("\n")
+
         if line_cb:
-            line_cb(line)
-        # Parse '123456 bytes ...' from dd/shred
-        m = re.search(r'(\d+)\s+bytes', line)
+            line_cb(s)
+
+        # I/O error detection
+        if any(rx.search(s) for rx in io_err_regexes):
+            reason = "io_error"
+            # Make it visible in the job log as well
+            if line_cb:
+                line_cb("I/O error detected; aborting wipe and marking disk as FAILED")
+            _kill_process_group(proc, reason="io_error")
+            break
+
+        # Progress parsing
+        m = re.search(r"(\d+)\s+bytes", s)
         if m:
             try:
                 done = int(m.group(1))
                 progress_cb(done)
+                if done != last_bytes:
+                    last_bytes = done
+                    last_change = now
             except Exception:
                 pass
-    proc.wait()
-    return proc.returncode
+
+        # Stall detection (no progress and still running)
+        if (now - last_change) > STALL_TIMEOUT_SEC:
+            reason = "stalled"
+            if line_cb:
+                line_cb(f"No progress for {STALL_TIMEOUT_SEC}s; aborting and marking as FAILED")
+            _kill_process_group(proc, reason="stalled")
+            break
+
+    # If we exited the loop naturally, wait for process
+    try:
+        rc = proc.wait(timeout=KILL_GRACE_SEC)
+    except Exception:
+        rc = proc.returncode if proc.returncode is not None else 1
+
+    return rc, reason
+
 
 
 @app.route("/api/wipe/<name>", methods=["POST"])
@@ -563,29 +631,79 @@ def start_wipe_job(name: str, level: str):
                 if level == "low":
                     job["method"] = "dd zero (1 pass) via wipectl"
                     cmd = ["sudo", "-n", "/usr/local/bin/wipectl", "hdd-zero", dev]
-                    rc = stream_cmd(cmd, set_progress, logline)
+                    rc, reason = stream_cmd(cmd, set_progress, logline)
+
                     # dd may exit non-zero at end-of-device; treat as success if >= 99.9%
                     if rc != 0 and job["bytes"] and job["size"] and job["bytes"] >= job["size"] * 0.999:
                         logline("dd ended with ENOSPC at end-of-device; treating as success")
-                        rc = 0
+                        rc, reason = (0, None)
+
+                    # explicit failure reasons (surface to UI and stop)
+                    if reason == "io_error":
+                        job["status"] = "error: io_error"
+                        logline("Disk reported I/O errors during wipe; marking as FAILED")
+                        publish()
+                        return
+                    if reason == "stalled":
+                        job["status"] = "error: stalled"
+                        logline("No progress for too long; likely failing media or cable. Marking as FAILED")
+                        publish()
+                        return
 
                 elif level == "med":
                     job["method"] = "zero + random (2 passes) via wipectl"
-                    # zero pass
-                    rc = stream_cmd(["sudo", "-n", "/usr/local/bin/wipectl", "hdd-zero", dev], set_progress, logline)
+
+                    # ---- zero pass ----
+                    rc, reason = stream_cmd(["sudo", "-n", "/usr/local/bin/wipectl", "hdd-zero", dev],
+                                            set_progress, logline)
                     if rc != 0 and job["bytes"] and job["size"] and job["bytes"] >= job["size"] * 0.999:
                         logline("dd ended with ENOSPC at end-of-device; treating zero pass as success")
-                        rc = 0
+                        rc, reason = (0, None)
+
+                    if reason == "io_error":
+                        job["status"] = "error: io_error"
+                        logline("I/O error during zero pass; marking disk as FAILED")
+                        publish()
+                        return
+                    if reason == "stalled":
+                        job["status"] = "error: stalled"
+                        logline("Zero pass stalled; marking disk as FAILED")
+                        publish()
+                        return
+
                     if rc != 0:
                         raise RuntimeError("zero pass failed")
-                    # random pass
-                    rc = stream_cmd(["sudo", "-n", "/usr/local/bin/wipectl", "hdd-random", dev], set_progress, logline)
+
+                    # ---- random pass ----
+                    rc, reason = stream_cmd(["sudo", "-n", "/usr/local/bin/wipectl", "hdd-random", dev],
+                                            set_progress, logline)
+
+                    if reason == "io_error":
+                        job["status"] = "error: io_error"
+                        logline("I/O error during random pass; marking disk as FAILED")
+                        publish()
+                        return
+                    if reason == "stalled":
+                        job["status"] = "error: stalled"
+                        logline("Random pass stalled; marking disk as FAILED")
+                        publish()
+                        return
 
                 else:
                     job["method"] = "DoD 7-pass via wipectl (shred)"
                     cmd = ["sudo", "-n", "/usr/local/bin/wipectl", "hdd-dod", dev]
-                    rc = stream_cmd(cmd, set_progress, logline)
+                    rc, reason = stream_cmd(cmd, set_progress, logline)
 
+                    if reason == "io_error":
+                        job["status"] = "error: io_error"
+                        logline("I/O error during DoD wipe; marking disk as FAILED")
+                        publish()
+                        return
+                    if reason == "stalled":
+                        job["status"] = "error: stalled"
+                        logline("DoD wipe stalled; marking disk as FAILED")
+                        publish()
+                        return
             else:
                 # ---------------- SSD ----------------
                 if level == "low":
