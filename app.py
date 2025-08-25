@@ -176,28 +176,14 @@ def is_rotational(name: str) -> bool:
 def device_size_bytes(devpath: str) -> int:
     """
     Return device size in bytes with multiple fallbacks.
+    Order matters:
+      1) /sys (no privileges needed)
+      2) lsblk (no privileges, reads sysfs)
+      3) blockdev (may require group perms; stderr silenced to avoid console spam)
     """
-    # 1) lsblk -nb
-    try:
-        out = subprocess.check_output(
-            ["lsblk", "-nb", "-o", "SIZE", devpath],
-            text=True
-        ).strip()
-        if out.isdigit():
-            return int(out)
-    except Exception:
-        pass
+    import subprocess, os
 
-    # 2) blockdev (try multiple locations)
-    for bd in ("blockdev", "/sbin/blockdev", "/usr/sbin/blockdev"):
-        try:
-            out = subprocess.check_output([bd, "--getsize64", devpath], text=True).strip()
-            if out.isdigit():
-                return int(out)
-        except Exception:
-            continue
-
-    # 3) sysfs: sectors * logical_block_size
+    # 1) sysfs: sectors * logical_block_size
     try:
         name = os.path.basename(devpath)
         with open(f"/sys/block/{name}/size", "r") as f:
@@ -210,7 +196,35 @@ def device_size_bytes(devpath: str) -> int:
             pass
         return sectors * lbs
     except Exception:
-        return 0
+        pass
+
+    # 2) lsblk (reads sysfs; should work unprivileged)
+    try:
+        out = subprocess.check_output(
+            ["lsblk", "-nb", "-o", "SIZE", devpath],
+            text=True,
+            stderr=subprocess.DEVNULL,   # avoid noise if something’s odd
+        ).strip()
+        if out.isdigit():
+            return int(out)
+    except Exception:
+        pass
+
+    # 3) blockdev (may need perms; silence stderr so we don't spam console)
+    for bd in ("blockdev", "/sbin/blockdev", "/usr/sbin/blockdev"):
+        try:
+            out = subprocess.check_output(
+                [bd, "--getsize64", devpath],
+                text=True,
+                stderr=subprocess.DEVNULL,   # <-- important
+            ).strip()
+            if out.isdigit():
+                return int(out)
+        except Exception:
+            continue
+
+    return 0
+
 
 
 def should_publish(name: str, action: str) -> bool:
